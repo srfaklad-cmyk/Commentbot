@@ -5,6 +5,7 @@ from aiohttp import web
 from telethon import TelegramClient, events, utils, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
+from telethon.tl.types import MessageEntityBold, MessageEntitySpoiler
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -17,7 +18,7 @@ SETTINGS_FILE = "ccbot_settings.json"
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ccbot")
 
-S = {"enabled": True, "channels": {}, "packs": {"default": ["🔥", "عالیه 👌", "ممنون از پست"]}}
+S = {"enabled": True, "fmt": {"bold": False, "spoiler": False}, "channels": {}, "packs": {"default": ["🔥", "عالیه 👌", "ممنون از پست"]}}
 client = None
 login_state = {}
 
@@ -25,7 +26,11 @@ HELP = """دستورها (داخل Saved Messages بفرست):
 /status — وضعیت
 /addch @channel یا -100123... — افزودن کانال
 /delch کانال — حذف کانال
-/delay کانال|all ثانیه — تأخیر کامنت
+/delay کانال|all ثانیه یا بازه مثل 30-50 — تأخیر کامنت
+/fmt bold on|off — بولد کردن کامنت
+/fmt spoiler on|off — اسپویلر کردن کامنت
+/addtext نام_پک
+متن چندخطی — افزودن یک متن کامل (چندخطی) به پک
 /setpack کانال|all نام_پک — انتخاب پک متن
 /packs — لیست پک‌ها
 /pack نام
@@ -101,15 +106,34 @@ async def join_discussion(ent):
 
 
 # ---------- کامنت گذاشتن ----------
+def delay_range(cfg):
+    d = cfg.get("delay", 7)
+    return (d[0], d[1]) if isinstance(d, list) else (d, d)
+
+
+def make_entities(text):
+    f = S.get("fmt", {})
+    n = len(text.encode("utf-16-le")) // 2
+    ents = []
+    if f.get("bold"):
+        ents.append(MessageEntityBold(0, n))
+    if f.get("spoiler"):
+        ents.append(MessageEntitySpoiler(0, n))
+    return ents or None
+
+
 async def comment(chat_id, msg, cfg):
     elapsed = (datetime.now(timezone.utc) - msg.date).total_seconds()
-    await asyncio.sleep(max(0, cfg.get("delay", 7) - elapsed))
+    lo, hi = delay_range(cfg)
+    await asyncio.sleep(max(0, random.uniform(lo, hi) - elapsed))
     texts = S["packs"].get(cfg.get("pack", "default")) or []
     if not texts:
         return
     for _ in range(3):
         try:
-            await client.send_message(chat_id, random.choice(texts), comment_to=msg.id)
+            text = random.choice(texts)
+            await client.send_message(chat_id, text, comment_to=msg.id,
+                                      formatting_entities=make_entities(text))
             return
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
@@ -141,8 +165,12 @@ async def on_cmd(event):
 
         elif cmd == "status":
             lines = ["🟢 روشن" if S["enabled"] else "⏸ متوقف"]
+            f = S.get("fmt", {})
+            lines.append(f"قالب: بولد={'✅' if f.get('bold') else '❌'} اسپویلر={'✅' if f.get('spoiler') else '❌'}")
             for k, c in S["channels"].items():
-                lines.append(f"• {c['title']} ({k}) | {c['delay']}s | پک: {c['pack']}")
+                lo, hi = delay_range(c)
+                d = f"{lo:g}s" if lo == hi else f"{lo:g}-{hi:g}s"
+                lines.append(f"• {c['title']} ({k}) | {d} | پک: {c['pack']}")
             if not S["channels"]:
                 lines.append("هنوز کانالی ثبت نشده")
             lines.append("پک‌ها: " + ", ".join(f"{n}({len(v)})" for n, v in S["packs"].items()))
@@ -169,8 +197,13 @@ async def on_cmd(event):
         elif cmd == "delay":
             target, val = rest.rsplit(None, 1)
             keys = find_ch(target)
+            if "-" in val:
+                lo, hi = [float(x) for x in val.split("-")]
+                d = [lo, hi]
+            else:
+                d = float(val)
             for k in keys:
-                S["channels"][k]["delay"] = float(val)
+                S["channels"][k]["delay"] = d
             await save_settings()
             await event.respond(f"⏱ تأخیر {val} ثانیه برای {len(keys)} کانال")
 
@@ -198,6 +231,25 @@ async def on_cmd(event):
             S["packs"].setdefault(name, []).extend(texts)
             await save_settings()
             await event.respond(f"✅ پک {name}: {len(S['packs'][name])} متن")
+
+        elif cmd == "fmt":
+            which, state = rest.lower().split()
+            if which not in ("bold", "spoiler"):
+                await event.respond("❌ فقط bold یا spoiler")
+                return
+            S.setdefault("fmt", {})[which] = state in ("on", "1", "yes")
+            await save_settings()
+            await event.respond(f"✅ {which}: {state}")
+
+        elif cmd == "addtext":
+            name, _, body = rest.partition("\n")
+            name, body = name.strip(), body.strip()
+            if not name or not body:
+                await event.respond("❌ شکل درست:\n/addtext نام_پک\nمتن")
+                return
+            S["packs"].setdefault(name, []).append(body)
+            await save_settings()
+            await event.respond(f"✅ متن به پک {name} اضافه شد ({len(S['packs'][name])} متن)")
 
         elif cmd == "deltext":
             name, num = rest.rsplit(None, 1)
